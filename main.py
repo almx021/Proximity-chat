@@ -1,6 +1,7 @@
 from paho.mqtt import client as mqtt
 from random import randint
 from threading import Thread
+from time import sleep
 from tkinter.scrolledtext import ScrolledText
 
 import Pyro5.api
@@ -9,7 +10,8 @@ import tkinter as tk
 
 class User:
     BGCOLOR = '#243256'
-    DEFAULT_BOLD_FONT_12 = ("TkDefaultFont", 12 , "bold")
+    DEFAULT_BOLD_FONT_12 = ("TkDefaultFont", 12, "bold")
+    DEFAULT_BOLD_FONT_16 = ("TkDefaultFont", 16, "bold")
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Proximity chat")
@@ -18,37 +20,87 @@ class User:
         self.root.protocol("WM_DELETE_WINDOW", self.finish)
         
         self.validator = root.register(self._validate_number)
+
+        self._username = ''
         self.__current_chat = None
+        self.__connected = False
 
-        self.create_start_screen()
+        self.load_application()
  
-    def create_start_screen(self):
-        start_frame = tk.Frame(self.root, bg=User.BGCOLOR)
-        start_frame.pack(expand=True)
+    def show_error_screen(self):
+        for widget in self.root.winfo_children():
+            widget.destroy()
 
-        username_frame = tk.Frame(start_frame, bg=User.BGCOLOR)
+        error_Frame = tk.Frame(self.root, bg=User.BGCOLOR)
+        error_Frame.pack(expand=True)
+
+        tk.Label(error_Frame, text="It was not possible to connect", bg=User.BGCOLOR, fg='white', font=User.DEFAULT_BOLD_FONT_16).pack()
+
+    def show_start_screen(self, position=None):
+        lat, lon = None, None
+        if position:
+            lat, lon = position
+        for widget in self.root.winfo_children():
+            widget.destroy()
+
+        self.start_frame = tk.Frame(self.root, bg=User.BGCOLOR)
+        self.start_frame.pack(expand=True)
+
+        username_frame = tk.Frame(self.start_frame, bg=User.BGCOLOR)
         username_frame.pack(anchor='w')
         username_label = tk.Label(username_frame, text="USERNAME", anchor="w", bg=User.BGCOLOR, fg='white', font=User.DEFAULT_BOLD_FONT_12)
         username_label.pack(side=tk.LEFT)
         username_input = tk.Entry(username_frame)
         username_input.pack(padx=7, side=tk.LEFT)
 
-        latitude_frame = tk.Frame(start_frame, bg=User.BGCOLOR)
+        latitude_frame = tk.Frame(self.start_frame, bg=User.BGCOLOR)
         latitude_frame.pack(pady=10, anchor='w')
         latitude_label = tk.Label(latitude_frame, text="LATITUDE", anchor="w", bg=User.BGCOLOR, fg='white', font=User.DEFAULT_BOLD_FONT_12)
         latitude_label.pack(side=tk.LEFT)
         latitude_input = tk.Entry(latitude_frame, validate="key", validatecommand=(self.validator, "%P"))
         latitude_input.pack(padx=20, side=tk.LEFT)
+        if lat:
+            latitude_input.insert(0, lat)
 
-        longitude_frame = tk.Frame(start_frame, bg=User.BGCOLOR)
+        longitude_frame = tk.Frame(self.start_frame, bg=User.BGCOLOR)
         longitude_frame.pack(anchor='w')
         longitude_label = tk.Label(longitude_frame, text="LONGITUDE", anchor="w", bg=User.BGCOLOR, fg='white', font=User.DEFAULT_BOLD_FONT_12)
         longitude_label.pack(side=tk.LEFT)
         longitude_input = tk.Entry(longitude_frame, validate="key", validatecommand=(self.validator, "%P"))
         longitude_input.pack(padx=5, side=tk.LEFT)
+        if lon:
+            longitude_input.insert(0, lon)
 
-        enter_button = tk.Button(start_frame, text="ENTRAR", font=("Arial", 12, "bold"), command=lambda: self.login(username_input.get(), latitude_input.get(), longitude_input.get()))
+        enter_button = tk.Button(self.start_frame, text="START", font=("Arial", 12, "bold"), command=lambda: self.login(username_input.get(), latitude_input.get(), longitude_input.get()))
         enter_button.pack(pady=20)
+
+    def load_application(self):
+        for widget in self.root.winfo_children():
+            widget.destroy()
+
+        text_list = ("Loading.", "Loading..", "Loading...")
+        idx = 0
+
+        loading_frame = tk.Frame(self.root, bg="#243256")
+        loading_frame.pack(expand=True)       
+
+        loading_label = tk.Label(loading_frame, text="", font=("Arial", 16, "bold"), bg="#243256", fg="white")
+        loading_label.pack()
+
+        def update_text():
+            nonlocal idx
+            if not self.__connected:
+                loading_label.config(text=text_list[idx])
+                idx = (idx + 1) % len(text_list)
+                root.after(500, update_text) 
+            elif self.__connected == 1:
+                self.server._pyroClaimOwnership()
+                self.show_start_screen()
+            elif self.__connected == 2:
+                self.show_error_screen()
+                
+        Thread(target=self.connect, daemon=True).start()
+        update_text()
 
     def login(self, username: str, latitude: str, longitude: str):
         if any([
@@ -57,9 +109,23 @@ class User:
             longitude.strip() == ''
         ]):
             return
-        self._username = username
+        
+        self._username = username.strip()
         self.set_location(latitude, longitude)
+
+        login_ok = self.server.add_user({self.get_username(): self.get_location()})
+        if not login_ok:
+            self.__connected = 2
+            self._username = None
+            self.show_start_screen(self.get_location())
+            self._current_latitude = None
+            self._current_longitude = None
+            warning_label = tk.Label(self.start_frame, text='INVALID USERNAME', fg='red', bg=User.BGCOLOR, font=User.DEFAULT_BOLD_FONT_12)
+            warning_label.pack()
+            return
+        
         self.show_main_screen()
+        Thread(target=self._check_location, daemon=True).start()
 
     def show_main_screen(self):
         for widget in self.root.winfo_children():
@@ -170,25 +236,27 @@ class User:
             value = self.contact_list.get(index)
             if (value == '') or (self.__current_chat is not None and self.__current_chat[1] == value):
                 return
-            print(f"{index} - {value}")
             if hasattr(self, "chat_box_frame"):
                 self.chat_box_frame.destroy()
-            self.generate_chat()
+
             self.__current_chat = [index, value]
+            self.generate_chat()
+
+    def _check_location(self):
+        while True:
+            sleep(120)
+            self.update_location()
 
     def update_location(self):
         lat, long = self.latitude_entry.get(), self.longitude_entry.get()
-
-        if (lat, long) == self.get_location(True):
-            return
 
         if lat.strip() == '' or long.strip() == '':
             self.reset_location()
             return
 
         self.set_location(lat, long)
+        self.server.update_user({self.get_username(): self.get_location()})
         self.update_contact_list()
-        print(self.get_location())
 
     def reset_location(self):
         self.latitude_entry.delete(0, tk.END)
@@ -197,14 +265,32 @@ class User:
         self.longitude_entry.insert(0, self.get_location()[1])
 
     def update_contact_list(self):
-        users = self.get_reachable_users().keys()
+        users = self.get_reachable_users()
         self.contact_list.delete(0, tk.END)
         self.contact_list.insert(tk.END, *users)
     
     def get_reachable_users(self) -> dict:
-        users = {'amigo 1':[0, 0.001], 'amigo 3': [0.00001, 0.001], 'amigo 2': [0.0001, 0.0001]}
-        users.update({'':''})
+        users = self.server.get_nearby_users(self.get_username(), self.get_location())
+        users.append('')
         return users
+
+    def connect(self):
+        try:
+            self.daemon = Pyro5.server.Daemon('localhost')
+            self.ns = Pyro5.api.locate_ns('localhost')
+            self.uri = self.daemon.register(self)
+            self.ns.register("client" + str(randint(0, 1000)), self.uri)
+
+            self.server = Pyro5.api.Proxy("PYRONAME:server")
+            self.server._Proxy__pyroCreateConnection()
+        except Exception:
+            self.__connected = 2
+            return
+
+        self.daemon_thread = Thread(target=self._listener_thread, args=(), daemon=True)
+        self.daemon_thread.start()
+        
+        self.__connected = 1
 
     def _listener_thread(self):
         self.daemon.requestLoop()
@@ -212,9 +298,12 @@ class User:
 
     def finish(self):
         self.root.destroy()
-        if hasattr(self, 'server'):
-            self.server.release(self.client_id)
+        if hasattr(self, 'server') and self.__connected not in (None, 2):
+            self.server.release_user(self.get_username())
             self.server._pyroRelease()
+
+    def get_username(self):
+        return self._username
 
     def get_location(self, as_string=False):
         if as_string:
