@@ -1,10 +1,9 @@
-from paho.mqtt import client as mqtt
+from typing import TypeAlias
 
 import math
 import Pyro5.api
 import Pyro5.server
 import tkinter as tk
-from typing import TypeAlias
 
 user_data: TypeAlias = dict[str, tuple[float, float]]
 
