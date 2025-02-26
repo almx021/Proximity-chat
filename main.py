@@ -1,9 +1,9 @@
-from paho.mqtt import client as mqtt
 from random import randint
 from threading import Thread
 from time import sleep
 from tkinter.scrolledtext import ScrolledText
 
+import redis
 import Pyro5.api
 import Pyro5.server
 import tkinter as tk
@@ -19,11 +19,13 @@ class User:
         self.root.configure(bg=User.BGCOLOR)
         self.root.protocol("WM_DELETE_WINDOW", self.finish)
         
-        self.validator = root.register(self._validate_number)
+        self.float_validator = root.register(self._validate_number)
 
         self._username = ''
         self.__current_chat = None
         self.__connected = False
+
+        self.redis_client = None
 
         self.load_application()
  
@@ -57,7 +59,7 @@ class User:
         latitude_frame.pack(pady=10, anchor='w')
         latitude_label = tk.Label(latitude_frame, text="LATITUDE", anchor="w", bg=User.BGCOLOR, fg='white', font=User.DEFAULT_BOLD_FONT_12)
         latitude_label.pack(side=tk.LEFT)
-        latitude_input = tk.Entry(latitude_frame, validate="key", validatecommand=(self.validator, "%P"))
+        latitude_input = tk.Entry(latitude_frame, validate="key", validatecommand=(self.float_validator, "%P"))
         latitude_input.pack(padx=20, side=tk.LEFT)
         if lat:
             latitude_input.insert(0, lat)
@@ -66,7 +68,7 @@ class User:
         longitude_frame.pack(anchor='w')
         longitude_label = tk.Label(longitude_frame, text="LONGITUDE", anchor="w", bg=User.BGCOLOR, fg='white', font=User.DEFAULT_BOLD_FONT_12)
         longitude_label.pack(side=tk.LEFT)
-        longitude_input = tk.Entry(longitude_frame, validate="key", validatecommand=(self.validator, "%P"))
+        longitude_input = tk.Entry(longitude_frame, validate="key", validatecommand=(self.float_validator, "%P"))
         longitude_input.pack(padx=5, side=tk.LEFT)
         if lon:
             longitude_input.insert(0, lon)
@@ -124,6 +126,9 @@ class User:
             warning_label.pack()
             return
         
+        self.__connected = 3
+        self.connect_to_redis()
+        
         self.show_main_screen()
         Thread(target=self._check_location, daemon=True).start()
 
@@ -156,7 +161,7 @@ class User:
 
         self.latitude_label = tk.Label(self.lat_long_frame, text="LATITUDE", bg=User.BGCOLOR, fg='white', font=User.DEFAULT_BOLD_FONT_12)
         self.latitude_label.pack()
-        self.latitude_entry = tk.Entry(self.lat_long_frame, validate="key", validatecommand=(self.validator, "%P"))
+        self.latitude_entry = tk.Entry(self.lat_long_frame, validate="key", validatecommand=(self.float_validator, "%P"))
         self.latitude_entry.bind("<Return>", self.update_location)
         self.latitude_entry.insert(0, latitude)
         self.latitude_entry.pack()
@@ -164,7 +169,7 @@ class User:
         self.longitude_label = tk.Label(self.lat_long_frame, text="LONGITUDE", fg='white', bg=User.BGCOLOR, font=User.DEFAULT_BOLD_FONT_12)
         self.longitude_label.pack(pady=(5, 0))
         
-        self.longitude_entry = tk.Entry(self.lat_long_frame, validate="key", validatecommand=(self.validator, "%P"))
+        self.longitude_entry = tk.Entry(self.lat_long_frame, validate="key", validatecommand=(self.float_validator, "%P"))
         self.longitude_entry.bind("<Return>", self.update_location)
         self.longitude_entry.insert(0, longitude)
         self.longitude_entry.pack()
@@ -217,17 +222,66 @@ class User:
         self.input_entry.delete(0, tk.END)
         self.write_message(message, True)
 
+        chatter = self.get_current_chatter()
+        sender = self.get_username()
+        channel = sender+"/"+chatter
+        users = self.update_contact_list()
+        if chatter not in users:
+            channel += "/200"
+        else:
+            self.retrieve_stashed_messages(channel)
+        self.publish_message(channel, self.get_username(), message)
+
     def write_message(self, message, message_sender=False):
         sender = "FRIEND" if not message_sender else "YOU"
 
-        self.chat_box.config(state="normal")
+        if self.chat_box:
+            self.chat_box.config(state="normal")
 
-        if len(self.chat_box.get('1.0', '1.2')) > 1 and self.chat_box.get(tk.END) != '\n':
-            self.chat_box.insert(tk.END, '\n')
-        self.chat_box.insert(tk.END, f"{sender}: {message}")
+            if len(self.chat_box.get('1.0', '1.2')) > 1 and self.chat_box.get(tk.END) != '\n':
+                self.chat_box.insert(tk.END, '\n')
+            self.chat_box.insert(tk.END, f"{sender}: {message}")
 
-        self.chat_box.config(state="disabled")
-        self.chat_box.see(tk.END)
+            self.chat_box.config(state="disabled")
+            self.chat_box.see(tk.END)
+
+    def publish_message(self, channel, sender, message):
+        self.redis_client.xadd(channel, {"sender": sender, "message": message})
+
+    def _read_channel(self):
+        chatter = self.get_current_chatter()
+        channel = chatter+"/"+self.get_username()
+        last_id = '0'
+        while chatter == self.get_current_chatter():
+            msg = self.redis_client.xread({channel:last_id}, count=1, block=5)
+            if msg:
+                for streams, entries in msg:
+                    for entry in entries:
+                        last_id, data = entry
+                        if chatter != self.get_current_chatter():
+                            return
+                        self.write_message(data['message'])
+                        self.redis_client.xtrim(channel, maxlen=0)
+
+    def retrieve_stashed_messages(self, channel):
+        stashed_messages = []
+        target_channel = channel + "/200"
+        while True:
+            msg = self.redis_client.xread({target_channel:'0'}, count=1, block=5)
+            if msg:
+                for streams, entries in msg:
+                    for entry in entries:
+                        last_id, data = entry
+                        stashed_messages.append(data['message'])
+                        self.redis_client.xdel(target_channel, last_id)
+            else:
+                if len(stashed_messages) > 0:
+                    self.redis_client.xtrim(target_channel, maxlen=0)
+                break
+
+        for message in stashed_messages:
+            self.publish_message(channel, self.get_username(), message)
+            sleep(0.1)
 
     def open_chat(self, event):
         selector = self.contact_list.curselection()
@@ -240,11 +294,14 @@ class User:
                 self.chat_box_frame.destroy()
 
             self.__current_chat = [index, value]
+            Thread(target=self._read_channel, daemon=True).start()
+
             self.generate_chat()
 
     def _check_location(self):
         while True:
             sleep(120)
+            self.server._pyroClaimOwnership()
             self.update_location()
 
     def update_location(self):
@@ -255,6 +312,7 @@ class User:
             return
 
         self.set_location(lat, long)
+        self.server._pyroClaimOwnership()
         self.server.update_user({self.get_username(): self.get_location()})
         self.update_contact_list()
 
@@ -268,11 +326,19 @@ class User:
         users = self.get_reachable_users()
         self.contact_list.delete(0, tk.END)
         self.contact_list.insert(tk.END, *users)
+        return users
     
     def get_reachable_users(self) -> dict:
+        self.server._pyroClaimOwnership()
         users = self.server.get_nearby_users(self.get_username(), self.get_location())
         users.append('')
         return users
+
+    def get_current_chatter(self) -> str:
+        return self.__current_chat[1] if self.__current_chat else False
+
+    def connect_to_redis(self):
+        self.redis_client = redis.Redis(host='localhost', port=6379, decode_responses=True)
 
     def connect(self):
         try:
@@ -298,21 +364,23 @@ class User:
 
     def finish(self):
         self.root.destroy()
-        if hasattr(self, 'server') and self.__connected not in (None, 2):
+        if hasattr(self, 'server') and self.__connected == 3:
+            self.server._pyroClaimOwnership()
             self.server.release_user(self.get_username())
             self.server._pyroRelease()
+        if self.redis_client:
+            self.redis_client.close()
 
     def get_username(self):
         return self._username
 
-    def get_location(self, as_string=False):
-        if as_string:
-            return str(self._current_latitude), str(self._current_longitude)
+    def get_location(self):
         return self._current_latitude, self._current_longitude
 
     def set_location(self, latitude, longitude):
         self._current_latitude = float(latitude)
         self._current_longitude = float(longitude)
+
 
 if __name__ == '__main__':
     root = tk.Tk()
